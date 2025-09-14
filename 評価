@@ -1,0 +1,106 @@
+# === 評価（点予測=中央値q50、区間= q10~q90） ===
+import os, json, numpy as np, pandas as pd, torch, torch.nn as nn
+from torch.utils.data import DataLoader, Dataset
+import pickle, math
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+import matplotlib.pyplot as plt
+
+OUT_DIR  = "/content/ntt_out"
+FEAT_CSV = "/content/ntt_data/engineered_timeseries.csv"
+
+# 1) 読み込み
+with open(f"{OUT_DIR}/meta.json") as f: meta = json.load(f)
+feat_cols = meta["feat_cols"]; LOOKBACK = meta["lookback"]
+
+with open(f"{OUT_DIR}/x_scaler.pkl","rb") as f: xsc = pickle.load(f)
+with open(f"{OUT_DIR}/y_scaler.pkl","rb") as f: ysc = pickle.load(f)
+
+df = pd.read_csv(FEAT_CSV, parse_dates=["date"], index_col="date")
+test_df = df[df["split"]=="test"].copy()
+val_df  = df[df["split"]=="val"].copy()   # 文脈用
+
+Xva_raw = val_df[feat_cols].values.astype("float32")
+Xte_raw = test_df[feat_cols].values.astype("float32")
+yte_raw = test_df["y_next_close"].values.astype("float32")
+
+Xva = xsc.transform(Xva_raw)
+Xte = xsc.transform(Xte_raw)
+yte = ysc.transform(yte_raw.reshape(-1,1)).ravel()
+
+# 2) シーケンス（val末尾Lを前置→testぶんだけ取り出す）
+def make_seq(X, y, L):
+    xs, ys = [], []
+    for i in range(L, len(X)):
+        xs.append(X[i-L:i]); ys.append(y[i])
+    return np.array(xs, np.float32), np.array(ys, np.float32)
+
+Xte_stack = np.vstack([Xva[-LOOKBACK:], Xte])
+yte_stack = np.hstack([np.zeros(LOOKBACK, dtype="float32"), yte])  # yは整合だけ取る（未使用）
+
+Xte_seq_all, _ = make_seq(Xte_stack, yte_stack, LOOKBACK)
+Xte_seq = Xte_seq_all[-len(yte):]
+
+# 3) モデル定義とロード
+class LSTMQuantile(nn.Module):
+    def __init__(self, d_in, d_h=64, n_layers=2, dropout=0.2, n_out=3):
+        super().__init__()
+        self.lstm = nn.LSTM(d_in, d_h, num_layers=n_layers, dropout=dropout, batch_first=True)
+        self.head = nn.Sequential(nn.Linear(d_h, 64), nn.ReLU(), nn.Linear(64, n_out))
+    def forward(self, x):
+        o,_ = self.lstm(x); return self.head(o[:,-1,:])
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = LSTMQuantile(d_in=Xte_seq.shape[-1]).to(device)
+model.load_state_dict(torch.load(f"{OUT_DIR}/lstm_quantile.pt", map_location=device))
+model.eval()
+
+# 4) 予測（q10,q50,q90）→ 価格に戻す
+with torch.no_grad():
+    preds = model(torch.tensor(Xte_seq).to(device)).cpu().numpy()  # [N,3] （標準化空間）
+yhat_q_std = preds
+yhat_q = ysc.inverse_transform(yhat_q_std)  # 実価格へ
+q10, q50, q90 = yhat_q[:,0], yhat_q[:,1], yhat_q[:,2]
+
+y_true = yte_raw  # 実価格
+dates  = test_df.index
+
+# 5) 指標（中央値=点予測）
+rmse = math.sqrt(mean_squared_error(y_true, q50))
+mae  = mean_absolute_error(y_true, q50)
+mape = float(np.mean(np.abs((y_true - q50)/y_true))*100)
+
+# 方向性（前日比の符号）
+prev_close = df.loc[test_df.index, "close"].shift(1).values
+dir_acc = float((np.sign(y_true - prev_close) == np.sign(q50 - prev_close)).mean())
+
+# 区間の被覆率と平均幅
+cover = float(((y_true >= q10) & (y_true <= q90)).mean())
+avg_width = float(np.mean(q90 - q10))
+
+metrics = {
+    "RMSE": rmse, "MAE": mae, "MAPE_%": mape,
+    "Directional_Accuracy": dir_acc,
+    "PI_Coverage(q10-q90)": cover,
+    "PI_Avg_Width": avg_width
+}
+print(json.dumps(metrics, indent=2))
+
+# 6) 可視化
+os.makedirs(OUT_DIR, exist_ok=True)
+
+plt.figure(figsize=(12,4))
+plt.plot(dates, y_true, label="Actual")
+plt.plot(dates, q50,  label="Pred q50")
+plt.fill_between(dates, q10, q90, alpha=0.2, label="q10–q90")
+plt.title("Prediction vs Actual (test)")
+plt.xlabel("date"); plt.ylabel("Close")
+plt.legend(); plt.tight_layout()
+plt.savefig(f"{OUT_DIR}/pred_vs_actual_interval.png"); plt.show()
+
+plt.figure(figsize=(6,4))
+plt.hist(y_true - q50, bins=50)
+plt.title("Error histogram (Actual - Pred q50)")
+plt.xlabel("price error"); plt.ylabel("count")
+plt.tight_layout(); plt.savefig(f"{OUT_DIR}/error_hist.png"); plt.show()
+
+print("図と指標を保存:", OUT_DIR)
