@@ -1,0 +1,98 @@
+# === 前処理・特徴量作成・保存 ===
+from google.colab import drive
+drive.mount('/content/drive')
+
+import os, re, numpy as np, pandas as pd
+
+RAW_CSV = "/content/drive/MyDrive/stock_price.csv"       # 入力
+OUT_DIR = "/content/ntt_data"; os.makedirs(OUT_DIR, exist_ok=True)
+FEAT_CSV = f"{OUT_DIR}/engineered_timeseries.csv"        # 出力（この後の学習で使う）
+
+# 1) ロードと列名正規化
+def parse_human_volume(x):
+    if pd.isna(x): return np.nan
+    s = str(x).strip().replace(",","")
+    m = re.match(r"^([0-9]*\.?[0-9]+)\s*([KMB]?)$", s, re.I)
+    if m:
+        v = float(m.group(1)); suf = m.group(2).upper()
+        return v * {"":1,"K":1e3,"M":1e6,"B":1e9}[suf]
+    try: return float(s)
+    except: return np.nan
+
+df = pd.read_csv(RAW_CSV)
+df = df.rename(columns={
+    "日付け":"date","日付":"date",
+    "終値":"close","始値":"open","高値":"high","安値":"low",
+    "出来高":"volume","変化率 %":"pct_change","変化率_%":"pct_change"
+})
+if "date" not in df.columns:
+    df = df.rename(columns={df.columns[0]:"date"})
+df["date"] = pd.to_datetime(df["date"])
+df = df.sort_values("date").drop_duplicates("date").set_index("date")
+
+for c in ["open","high","low","close"]:
+    if c in df.columns: df[c] = pd.to_numeric(df[c], errors="coerce")
+if "volume" in df.columns:
+    # 文字K/M/Bに対応
+    df["volume"] = df["volume"].apply(parse_human_volume)
+
+# 2) 基本派生
+df["logret"] = np.log(df["close"]/df["close"].shift(1))
+df["ret"]    = df["close"].pct_change()
+df["log_volume"] = np.log1p(df["volume"]) if "volume" in df else 0.0
+
+# 3) テクニカル（t時点までで計算）
+feat = df.copy()
+feat["SMA_5"]  = feat["close"].rolling(5).mean()
+feat["SMA_25"] = feat["close"].rolling(25).mean()
+feat["EMA_12"] = feat["close"].ewm(span=12, adjust=False).mean()
+feat["EMA_26"] = feat["close"].ewm(span=26, adjust=False).mean()
+feat["MACD"] = feat["EMA_12"] - feat["EMA_26"]
+feat["MACD_signal"] = feat["MACD"].ewm(span=9, adjust=False).mean()
+feat["rv_10"] = feat["logret"].rolling(10).std()
+
+# ATR_14
+tr = pd.concat([
+    (feat["high"]-feat["low"]).abs(),
+    (feat["high"]-feat["close"].shift(1)).abs(),
+    (feat["low"] -feat["close"].shift(1)).abs()
+], axis=1).max(axis=1)
+feat["ATR_14"] = tr.rolling(14).mean()
+
+# カレンダー
+m = feat.index.month
+feat["month_sin"] = np.sin(2*np.pi*m/12); feat["month_cos"] = np.cos(2*np.pi*m/12)
+dow = feat.index.dayofweek
+for d in range(5):
+    feat[f"dow_{d}"] = (dow==d).astype(int)
+
+# 4) 目的変数（翌日の終値）。特徴と同時にNaNを落とす
+feat["y_next_close"]    = feat["close"].shift(-1)
+feat["y_next_logret"]   = np.log(feat["y_next_close"]/feat["close"])
+
+# 学習に使う列
+keep_cols = [
+    "close","open","high","low","log_volume","logret","ret",
+    "SMA_5","SMA_25","EMA_12","EMA_26","MACD","MACD_signal","rv_10","ATR_14",
+    "month_sin","month_cos"
+] + [f"dow_{d}" for d in range(5)] + ["y_next_close","y_next_logret"]
+
+feat = feat[keep_cols].dropna().copy()
+
+# 5) 時系列分割ラベル（70/15/15）
+n = len(feat)
+i1, i2 = int(n*0.70), int(n*0.85)
+split = np.array(["train"]*n, dtype=object)
+split[i1:i2] = "val"; split[i2:] = "test"
+feat["split"] = split
+
+# 6) 外れ基準は train だけで推定 → フラグと学習重み
+sigma = feat.loc[feat["split"]=="train","logret"].std()
+thr = 3*sigma  # ≈ 5.6% 目安
+feat["big_move"] = (feat["logret"].abs() > thr).astype(int)
+feat["sample_weight"] = np.where((feat["split"]=="train") & (feat["big_move"]==1), 0.5, 1.0)
+
+# 7) 保存
+feat.to_csv(FEAT_CSV)
+print("保存:", FEAT_CSV, "| 行数:", len(feat), "| train/val/test:", (feat["split"]=="train").sum(), (feat["split"]=="val").sum(), (feat["split"]=="test").sum())
+print("3σしきい値 thr =", round(thr,6))
