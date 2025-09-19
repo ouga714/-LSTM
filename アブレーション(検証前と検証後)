@@ -1,0 +1,377 @@
+# ============================================================
+# 新旧モデル アブレーション実験 一括実行セル（Colab）
+# ============================================================
+from google.colab import drive
+drive.mount('/content/drive', force_remount=False)
+
+import os, re, math, json, pickle, numpy as np, pandas as pd
+import torch, torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import mean_squared_error, mean_absolute_error, accuracy_score
+
+# -------------------
+# Paths
+# -------------------
+RAW_CSV  = "/content/drive/MyDrive/stock_price.csv"
+DATA_DIR = "/content/ntt_data"; os.makedirs(DATA_DIR, exist_ok=True)
+FEAT_CSV = f"{DATA_DIR}/engineered_timeseries.csv"
+OUT_DIR  = "/content/ntt_out/ablation"; os.makedirs(OUT_DIR, exist_ok=True)
+
+LOOKBACK = 60
+BATCH = 128
+EPOCHS = 40
+PATIENCE = 7
+USE_WEIGHTS=True
+QUANTILES = torch.tensor([0.1,0.5,0.9], dtype=torch.float32)
+DEVICE=torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# -------------------
+# Utils
+# -------------------
+def parse_human_volume(x):
+    if pd.isna(x): return np.nan
+    s = str(x).strip().replace(",","")
+    m = re.match(r"^([0-9]*\.?[0-9]+)\s*([KMB]?)$", s, re.I)
+    if m:
+        v = float(m.group(1)); suf = m.group(2).upper()
+        return v * {"":1,"K":1e3,"M":1e6,"B":1e9}[suf]
+    try: return float(s)
+    except: return np.nan
+
+def ensure_features():
+    if os.path.isfile(FEAT_CSV): return
+    df = pd.read_csv(RAW_CSV)
+    df = df.rename(columns={"日付け":"date","日付":"date","終値":"close","始値":"open","高値":"high","安値":"low","出来高":"volume"})
+    if "date" not in df.columns: df = df.rename(columns={df.columns[0]:"date"})
+    df["date"]=pd.to_datetime(df["date"])
+    df = df.sort_values("date").drop_duplicates("date").set_index("date")
+    for c in ["open","high","low","close"]:
+        if c in df.columns: df[c]=pd.to_numeric(df[c], errors="coerce")
+    if "volume" in df.columns: df["volume"]=df["volume"].apply(parse_human_volume)
+
+    df["ret"]=df["close"].pct_change()
+    df["logret"]=np.log(df["close"]/df["close"].shift(1))
+    df["log_volume"]=np.log1p(df["volume"]) if "volume" in df else 0.0
+
+    feat=df.copy()
+    feat["SMA_5"]=feat["close"].rolling(5).mean()
+    feat["SMA_25"]=feat["close"].rolling(25).mean()
+    feat["EMA_12"]=feat["close"].ewm(span=12, adjust=False).mean()
+    feat["EMA_26"]=feat["close"].ewm(span=26, adjust=False).mean()
+    feat["MACD"]=feat["EMA_12"]-feat["EMA_26"]
+    feat["MACD_signal"]=feat["MACD"].ewm(span=9, adjust=False).mean()
+    feat["rv_10"]=feat["logret"].rolling(10).std()
+
+    tr=pd.concat([
+        (feat["high"]-feat["low"]).abs(),
+        (feat["high"]-feat["close"].shift(1)).abs(),
+        (feat["low"] -feat["close"].shift(1)).abs()
+    ],axis=1).max(axis=1)
+    feat["ATR_14"]=tr.rolling(14).mean()
+
+    m=feat.index.month
+    feat["month_sin"]=np.sin(2*np.pi*m/12); feat["month_cos"]=np.cos(2*np.pi*m/12)
+    dow=feat.index.dayofweek
+    for d in range(5): feat[f"dow_{d}"]=(dow==d).astype(int)
+
+    feat["y_next_close"]=feat["close"].shift(-1)
+    feat["y_next_logret"]=np.log(feat["y_next_close"]/feat["close"])
+
+    keep=["close","open","high","low","log_volume","logret","ret",
+          "SMA_5","SMA_25","EMA_12","EMA_26","MACD","MACD_signal","rv_10","ATR_14",
+          "month_sin","month_cos"]+[f"dow_{d}" for d in range(5)]+["y_next_close","y_next_logret"]
+    feat=feat[keep].dropna().copy()
+
+    n=len(feat); i1,i2=int(n*0.70), int(n*0.85)
+    split=np.array(["train"]*n, dtype=object); split[i1:i2]="val"; split[i2:]="test"
+    feat["split"]=split
+
+    sigma=feat.loc[feat["split"]=="train","logret"].std()
+    thr=3*sigma
+    feat["big_move"]=(feat["logret"].abs()>thr).astype(int)
+    feat["sample_weight"]=np.where((feat["split"]=="train")&(feat["big_move"]==1),0.5,1.0)
+
+    feat.to_csv(FEAT_CSV)
+    print("features saved:", FEAT_CSV)
+
+ensure_features()
+
+# -------------------
+# Data & scalers
+# -------------------
+df = pd.read_csv(FEAT_CSV, parse_dates=["date"], index_col="date")
+reserved={"y_next_close","y_next_logret","split","big_move","sample_weight"}
+feat_cols=[c for c in df.columns if c not in reserved]
+
+train_df=df[df["split"]=="train"].copy()
+val_df  =df[df["split"]=="val"].copy()
+test_df =df[df["split"]=="test"].copy()
+
+def to_np(d):
+    return d[feat_cols].values.astype("float32"), d["y_next_close"].values.astype("float32"), d["sample_weight"].values.astype("float32")
+
+Xtr_raw,ytr_raw,wtr_raw=to_np(train_df)
+Xva_raw,yva_raw,_     =to_np(val_df)
+Xte_raw,yte_raw,_     =to_np(test_df)
+
+xsc, ysc = StandardScaler(), StandardScaler()
+Xtr = xsc.fit_transform(Xtr_raw); Xva=xsc.transform(Xva_raw); Xte=xsc.transform(Xte_raw)
+ytr = ysc.fit_transform(ytr_raw.reshape(-1,1)).ravel()
+yva = ysc.transform(yva_raw.reshape(-1,1)).ravel()
+yte = ysc.transform(yte_raw.reshape(-1,1)).ravel()
+
+def make_seqXy(X,y,L):
+    xs,ys=[],[]
+    for i in range(L,len(X)):
+        xs.append(X[i-L:i]); ys.append(y[i])
+    return np.array(xs,np.float32), np.array(ys,np.float32)
+
+Xtr_seq,ytr_seq=make_seqXy(Xtr,ytr,LOOKBACK)
+wtr_seq = wtr_raw[LOOKBACK:] if USE_WEIGHTS else np.ones_like(ytr_seq, dtype="float32")
+
+Xva_stack=np.vstack([Xtr[-LOOKBACK:],Xva]); yva_stack=np.hstack([ytr[-LOOKBACK:],yva])
+Xva_seq_all,yva_seq_all=make_seqXy(Xva_stack,yva_stack,LOOKBACK)
+Xva_seq,yva_seq=Xva_seq_all[-len(yva):], yva_seq_all[-len(yva):]
+
+Xte_stack=np.vstack([Xva[-LOOKBACK:],Xte])
+def make_seqX_only(X,L): return np.array([X[i-L:i] for i in range(L,len(X))], np.float32)
+Xte_seq_all=make_seqX_only(Xte_stack, LOOKBACK)
+Xte_seq=Xte_seq_all[-len(yte):]
+
+class SeqDS(Dataset):
+    def __init__(self,X,y,w=None):
+        self.X=torch.tensor(X); self.y=torch.tensor(y)
+        self.w=torch.tensor(w) if w is not None else torch.ones(len(y),dtype=torch.float32)
+    def __len__(self): return len(self.y)
+    def __getitem__(self,i): return self.X[i], self.y[i], self.w[i]
+
+train_dl=DataLoader(SeqDS(Xtr_seq,ytr_seq,wtr_seq), batch_size=BATCH, shuffle=True)
+val_dl  =DataLoader(SeqDS(Xva_seq,yva_seq,np.ones_like(yva_seq)), batch_size=256, shuffle=False)
+
+# -------------------
+# Models
+# -------------------
+class LSTMQuantile(nn.Module):  # 旧
+    def __init__(self, d_in, d_h=64, n_layers=2, dropout=0.2, n_out=3):
+        super().__init__()
+        self.lstm=nn.LSTM(d_in,d_h,num_layers=n_layers,dropout=dropout,batch_first=True)
+        self.head=nn.Sequential(nn.Linear(d_h,64), nn.ReLU(), nn.Linear(64,n_out))
+    def forward(self,x):
+        o,_=self.lstm(x)
+        return self.head(o[:,-1,:])
+
+class LSTMMonoQuantile(nn.Module):  # 新（単調パラメトリック）
+    def __init__(self, d_in, d_h=64, n_layers=2, dropout=0.2):
+        super().__init__()
+        self.lstm=nn.LSTM(d_in,d_h,num_layers=n_layers,dropout=dropout,batch_first=True)
+        self.head=nn.Sequential(nn.Linear(d_h,64), nn.ReLU(), nn.Linear(64,3)) # m,a,b
+        self.softplus=nn.Softplus()
+    def forward(self,x):
+        o,_=self.lstm(x)
+        h=self.head(o[:,-1,:])
+        m=h[:,0:1]; a=self.softplus(h[:,1:2]); b=self.softplus(h[:,2:3])
+        q10=m-a; q50=m; q90=m+b
+        return torch.cat([q10,q50,q90], dim=1)
+
+# ピンボール損失（サンプル別平均を返す）→重みに使う
+def pinball_per_sample(y, yhat, qs):
+    # y:[B], yhat:[B,3], qs:[3]
+    y = y.unsqueeze(1)
+    e = y - yhat
+    loss = torch.maximum(qs*e, (qs-1)*e).mean(dim=1)  # [B]
+    return loss
+
+def train_quantile(model, lambda_width=0.0):
+    opt=torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-5)
+    best=1e9; bad=0
+    for ep in range(1,EPOCHS+1):
+        model.train(); tr=0; n=0
+        for xb,yb,wb in train_dl:
+            xb,yb,wb=xb.to(DEVICE),yb.to(DEVICE),wb.to(DEVICE)
+            opt.zero_grad()
+            q=model(xb)
+            loss_ps = pinball_per_sample(yb,q,QUANTILES.to(DEVICE))  # [B]
+            loss = (loss_ps*wb).mean() if USE_WEIGHTS else loss_ps.mean()
+            if lambda_width>0:
+                width=(q[:,2]-q[:,0]).mean()
+                loss=loss + lambda_width*width
+            loss.backward(); opt.step()
+            tr+=loss.item()*xb.size(0); n+=xb.size(0)
+        tr/=n
+        model.eval(); va=0; n=0
+        with torch.no_grad():
+            for xb,yb,_ in val_dl:
+                xb,yb=xb.to(DEVICE),yb.to(DEVICE)
+                q=model(xb)
+                loss_ps = pinball_per_sample(yb,q,QUANTILES.to(DEVICE))
+                loss = loss_ps.mean()
+                if lambda_width>0:
+                    width=(q[:,2]-q[:,0]).mean()
+                    loss=loss + lambda_width*width
+                va+=loss.item()*xb.size(0); n+=xb.size(0)
+        va/=n
+        print(f"ep{ep:02d} train={tr:.5f} val={va:.5f}")
+        if va<best: best=va; bad=0; best_state={k:v.detach().cpu().clone() for k,v in model.state_dict().items()}
+        else:
+            bad+=1
+            if bad>=PATIENCE: break
+    model.load_state_dict(best_state)
+    return model
+
+def inv_transform_q(pred_std):  # [N,3] -> price
+    return ysc.inverse_transform(pred_std)
+
+def predict(model, X_seq):
+    model.eval()
+    with torch.no_grad():
+        q_std=model(torch.tensor(X_seq).to(DEVICE)).cpu().numpy()
+    return inv_transform_q(q_std)
+
+# 評価ブロック
+def eval_block(y_true, q10, q50, q90, prev_close):
+    mask=~np.isnan(prev_close)
+    y=y_true[mask]; q10m,q50m,q90m=q10[mask],q50[mask],q90[mask]; prev=prev_close[mask]
+    rmse=math.sqrt(mean_squared_error(y,q50m))
+    mae=mean_absolute_error(y,q50m)
+    true3=np.sign(y-prev).astype(int); pred3=np.sign(q50m-prev).astype(int)
+    da3=float((true3==pred3).mean())
+    nz=(true3!=0)
+    da2=float(accuracy_score((true3[nz]>0).astype(int), (pred3[nz]>0).astype(int))) if nz.any() else float('nan')
+    cov=float(((y>=q10m)&(y<=q90m)).mean())
+    wid=float(np.mean(q90m-q10m))
+    sma5 = df["SMA_5"].reindex(test_df.index).values[mask]
+    da3_sma=float((np.sign(sma5-prev).astype(int)==true3).mean())
+    return {"RMSE":rmse,"MAE":mae,"DA_3class_q50":da3,"DA_2class_q50":da2,"SMA5_DA_3class":da3_sma,"PI_Coverage":cov,"PI_AvgWidth":wid}
+
+def cqr_adjust(q10_v, q90_v, y_v, q10_t, q90_t, alpha=0.10):
+    s=np.maximum(q10_v-y_v, y_v-q90_v)
+    k=int(np.ceil((1-alpha)*(len(s)+1)))-1; k=np.clip(k,0,len(s)-1)
+    gamma=float(np.partition(s,k)[k])
+    return q10_t - gamma, q90_t + gamma, gamma
+
+# -------------------
+# Train variants
+#   A) Old baseline (LSTMQuantile)
+#   B) New mono (lambda=0)
+#   C) New mono (lambda=0.01)  ← interval tightening
+# -------------------
+print("\n=== Train A: OLD (LSTMQuantile) ===")
+old=LSTMQuantile(d_in=Xtr_seq.shape[-1]).to(DEVICE)
+old=train_quantile(old, lambda_width=0.0)
+
+print("\n=== Train B: NEW-mono (λ=0) ===")
+new0=LSTMMonoQuantile(d_in=Xtr_seq.shape[-1]).to(DEVICE)
+new0=train_quantile(new0, lambda_width=0.0)
+
+print("\n=== Train C: NEW-mono (λ=0.01) ===")
+LAMBDA=0.01
+new1=LSTMMonoQuantile(d_in=Xtr_seq.shape[-1]).to(DEVICE)
+new1=train_quantile(new1, lambda_width=LAMBDA)
+
+# -------------------
+# Predict val/test
+# -------------------
+def predict_on_sets(model):
+    pred_va = predict(model, Xva_seq)
+    pred_te = predict(model, Xte_seq)
+    return pred_va, pred_te
+
+old_va, old_te = predict_on_sets(old)
+new0_va, new0_te = predict_on_sets(new0)
+new1_va, new1_te = predict_on_sets(new1)
+
+# -------------------
+# CQR calibration (90%) and evaluation
+# -------------------
+prev_close = df.loc[test_df.index, "close"].shift(1).values
+
+def eval_all(name, va, te):
+    q10v,q50v,q90v = va[:,0], va[:,1], va[:,2]
+    q10t,q50t,q90t = te[:,0], te[:,1], te[:,2]
+    # raw
+    raw = eval_block(yte_raw, q10t, q50t, q90t, prev_close)
+    # CQR
+    q10c, q90c, gamma = cqr_adjust(q10v, q90v, yva_raw, q10t, q90t, alpha=0.10)
+    cov=float(((yte_raw>=q10c)&(yte_raw<=q90c)).mean()); wid=float(np.mean(q90c-q10c))
+    return {
+        "name": name,
+        "raw": raw,
+        "CQR": {"PI_Coverage":cov, "PI_AvgWidth":wid, "gamma":gamma},
+        "vectors": {"q10":q10t,"q50":q50t,"q90":q90t,"q10_c":q10c,"q90_c":q90c}
+    }
+
+resA = eval_all("A_old", old_va, old_te)
+resB = eval_all("B_new_mono_lambda0", new0_va, new0_te)
+resC = eval_all("C_new_mono_lambda0.01", new1_va, new1_te)
+
+# -------------------
+# Direction classifier (logistic, up/down), trained on train
+# -------------------
+def extra_feats(idx):
+    delta = idx.to_series().diff().dt.days.fillna(1).values.astype("float32")
+    after_gap = (delta>3).astype("float32")
+    if "volume" in df.columns:
+        vol = np.log1p(df["volume"].reindex(idx).values.astype("float32"))
+        s = pd.Series(vol, index=idx)
+        z60 = ((s - s.rolling(60).mean())/s.rolling(60).std()).fillna(0).values.astype("float32")
+    else:
+        z60 = np.zeros(len(idx), dtype="float32")
+    return np.stack([delta, after_gap, z60], axis=1)
+
+EX_tr = extra_feats(train_df.index)
+EX_te = extra_feats(test_df.index)
+exsc = StandardScaler().fit(EX_tr)
+EX_tr_sc = exsc.transform(EX_tr); EX_te_sc=exsc.transform(EX_te)
+
+prev_tr = train_df["close"].shift(1).values
+dir_tr = np.sign(train_df["y_next_close"].values - prev_tr)
+mask_tr = dir_tr!=0
+X_dir_tr = np.hstack([Xtr_raw[mask_tr], EX_tr_sc[mask_tr]])
+dir_scaler = StandardScaler().fit(X_dir_tr)
+X_dir_tr_sc = dir_scaler.transform(X_dir_tr)
+y_dir_tr = (dir_tr[mask_tr]>0).astype(int)
+
+clf = LogisticRegression(max_iter=1000, class_weight="balanced")
+clf.fit(X_dir_tr_sc, y_dir_tr)
+
+# test eval
+prev_te = df.loc[test_df.index, "close"].shift(1).values
+mask_te = ~np.isnan(prev_te)
+true3 = np.sign(yte_raw[mask_te]-prev_te[mask_te]).astype(int)
+X_dir_te = np.hstack([Xte_raw, EX_te_sc])
+X_dir_te_sc = dir_scaler.transform(X_dir_te[mask_te])
+p_up = clf.predict_proba(X_dir_te_sc)[:,1]
+idx = true3!=0
+da2_clf = float(accuracy_score((true3[idx]>0).astype(int), (p_up[idx]>=0.5).astype(int))) if idx.any() else float('nan')
+
+# -------------------
+# Summaries（flatの定義と呼び出しを修正）
+# -------------------
+def flat(d):
+    r = {"model": d["name"]}
+    for k,v in d["raw"].items(): r[f"raw_{k}"]=v
+    for k,v in d["CQR"].items(): r[f"CQR_{k}"]=v
+    return r
+
+df_sum = pd.DataFrame([flat(resA), flat(resB), flat(resC)])
+# deltas vs A_old
+base = df_sum.iloc[0].copy()
+for col in df_sum.columns:
+    if col=="model": continue
+    try:
+        df_sum[f"delta_{col}"] = df_sum[col] - float(base[col])
+    except Exception:
+        df_sum[f"delta_{col}"] = np.nan
+
+# 方向分類器の指標を付加（新: λ=0.01列に付与）
+df_sum.loc[df_sum["model"]=="C_new_mono_lambda0.01","dir_clf_DA2_at_0.5"] = da2_clf
+
+os.makedirs(OUT_DIR, exist_ok=True)
+df_sum.to_csv(os.path.join(OUT_DIR, "ablation_summary.csv"), index=False)
+
+print("\n=== Ablation summary (key columns) ===")
+print(df_sum[["model","raw_RMSE","raw_MAE","raw_DA_3class_q50","raw_PI_Coverage","raw_PI_AvgWidth","CQR_PI_Coverage","CQR_PI_AvgWidth","dir_clf_DA2_at_0.5"]])
+
+print("\nSaved:", OUT_DIR)
