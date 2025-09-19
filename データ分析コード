@@ -1,0 +1,154 @@
+import os, re, math
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from IPython.display import display
+
+plt.rcParams["figure.figsize"] = (10, 4)
+
+CSV_PATH = "/content/drive/MyDrive/stock_price.csv"  # ←指定のファイル
+OUT_DIR  = "/content/ntt_eda"
+os.makedirs(OUT_DIR, exist_ok=True)
+
+# =========================
+# 1) 読む（日本語列に対応）
+# =========================
+def parse_human_volume(x):
+    """ '79.15M' のような表記を数値へ """
+    if pd.isna(x): return np.nan
+    s = str(x).replace(",", "").strip()
+    m = re.match(r"^([0-9]*\.?[0-9]+)\s*([KMB]?)$", s, re.I)
+    if m:
+        v = float(m.group(1)); suf = m.group(2).upper()
+        return v * {"":1, "K":1e3, "M":1e6, "B":1e9}[suf]
+    try:
+        return float(s)
+    except:
+        return np.nan
+
+df = pd.read_csv(CSV_PATH)
+
+# よくある日本語カラム名を英語化
+df = df.rename(columns={
+    "日付け":"date", "日付":"date",
+    "終値":"close", "始値":"open", "高値":"high", "安値":"low",
+    "出来高":"volume", "変化率 %":"pct_change", "変化率_%":"pct_change"
+})
+if "date" not in df.columns:
+    df = df.rename(columns={df.columns[0]:"date"})
+
+# 型を整えて並べ替え
+df["date"] = pd.to_datetime(df["date"])
+df = df.sort_values("date").drop_duplicates("date").set_index("date")
+for c in ["open","high","low","close"]:
+    if c in df.columns:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+if "volume" in df.columns:
+    df["volume"] = df["volume"].apply(parse_human_volume)
+
+# 追加の列（分析用）
+df["ret"]    = df["close"].pct_change()
+df["logret"] = np.log(df["close"]/df["close"].shift(1))
+if "volume" in df.columns:
+    df["log_volume"] = np.log1p(df["volume"])
+
+# =========================
+# 2) 基本統計量（平均、分散など）
+# =========================
+num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+stats = df[num_cols].describe(percentiles=[.01,.05,.25,.5,.75,.95,.99]).T
+stats["skew"]     = df[num_cols].skew()   # 歪度
+stats["kurtosis"] = df[num_cols].kurt()   # 尖度
+
+print("■ 基本統計量")
+display(stats)
+stats.to_csv(f"{OUT_DIR}/basic_stats.csv")
+
+print("\n■ データの期間と欠損")
+print("期間:", df.index.min().date(), "→", df.index.max().date(), "| 行数:", len(df))
+display(df[num_cols].isna().sum().to_frame("missing_count"))
+
+# =========================
+# 3) 推移のグラフ（見る）
+# =========================
+def save_line(series, title, fname, ylabel=None):
+    plt.figure()
+    series.plot()
+    plt.title(title)
+    plt.xlabel("date")
+    plt.ylabel(ylabel or title)
+    plt.tight_layout()
+    plt.savefig(f"{OUT_DIR}/{fname}")
+    plt.show()
+
+# 価格（終値）
+save_line(df["close"], "Close", "close.png", "price")
+
+# 高値-安値レンジ（帯）と終値
+if set(["high","low","close"]).issubset(df.columns):
+    plt.figure()
+    plt.plot(df.index, df["close"], label="close")
+    plt.fill_between(df.index, df["low"], df["high"], alpha=0.2, label="range H-L")
+    plt.title("Price range (H-L) and Close")
+    plt.xlabel("date"); plt.ylabel("price")
+    plt.legend()
+    plt.tight_layout()  # 修正: tight_layout() を正しく呼ぶ
+    plt.savefig(f"{OUT_DIR}/range.png")
+    plt.show()
+
+# 出来高と対数出来高
+if "volume" in df.columns:
+    save_line(df["volume"], "Volume", "volume.png", "shares")
+    save_line(df["log_volume"], "log1p(Volume)", "log_volume.png", "log(shares)")
+
+# 対数リターン（変動の大きさ）
+save_line(df["logret"].dropna(), "Log return", "logret.png", "log return")
+
+# ローリング平均・分散（直近の傾向とばらつき）
+win = 20
+roll_mean = df["close"].rolling(win).mean()
+roll_std  = df["close"].rolling(win).std()
+save_line(roll_mean, f"Rolling mean ({win})", "rolling_mean.png", "price")
+save_line(roll_std,  f"Rolling std  ({win})", "rolling_std.png", "std")
+
+# =========================
+# 4) 季節性（カレンダー観点）
+# =========================
+cal = pd.DataFrame(index=df.index)
+cal["month"] = df.index.month
+cal["dow"]   = df.index.dayofweek
+cal["ret"]   = df["ret"]
+
+# 月別平均リターン
+monthly = cal.groupby("month")["ret"].mean()
+plt.figure(); monthly.plot(kind="bar")
+plt.title("Mean return by month")
+plt.xlabel("month"); plt.ylabel("mean ret")
+plt.tight_layout(); plt.savefig(f"{OUT_DIR}/month_ret.png"); plt.show()
+
+# 曜日別（0=Mon, …,4=Fri）平均リターン
+dow_mean = cal[cal["dow"]<5].groupby("dow")["ret"].mean()
+plt.figure(); dow_mean.plot(kind="bar")
+plt.title("Mean return by weekday (0=Mon)")
+plt.xlabel("weekday"); plt.ylabel("mean ret")
+plt.tight_layout(); plt.savefig(f"{OUT_DIR}/dow_ret.png"); plt.show()
+
+# =========================
+# 5) 異常（大きな変動日）とギャップ
+# =========================
+# 大変動日: logret の3σ超
+thr = 3 * df["logret"].std(skipna=True)
+big = df["logret"].abs() > thr
+events = df.loc[big, ["close","logret"] + (["volume"] if "volume" in df.columns else [])]
+print("\n■ 大きな変動日の候補（絶対logretが3σ超） 上位10件")
+display(events.reindex(events["logret"].abs().sort_values(ascending=False).index).head(10))
+events.to_csv(f"{OUT_DIR}/big_moves.csv")
+
+# 時系列の大きな空白（3日超のギャップ）
+gaps = (df.index.to_series().diff().dt.days.fillna(0) > 3)
+gap_days = df.index[gaps]
+print("■ 3日超のギャップ件数:", len(gap_days))
+if len(gap_days)>0:
+    print("例:", list(gap_days[:5]))
+
+print(f"\n保存先: {OUT_DIR}")
