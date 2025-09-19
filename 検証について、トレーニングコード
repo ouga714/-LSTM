@@ -1,0 +1,156 @@
+# ============================
+# セル2) 学習
+#  - 区間を狭める：単調パラメトリック分位 + 幅ペナルティ
+#  - 方向を当てる：ロジスティック分類器（up/down）
+# ============================
+import os, json, numpy as np, pandas as pd, torch, torch.nn as nn, pickle
+from torch.utils.data import Dataset, DataLoader
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LogisticRegression
+
+FEAT_CSV = "/content/ntt_data/engineered_timeseries.csv"
+OUT_DIR  = "/content/ntt_out"; os.makedirs(OUT_DIR, exist_ok=True)
+LOOKBACK = 60
+USE_WEIGHTS = True
+QUANTILES = torch.tensor([0.1,0.5,0.9], dtype=torch.float32)
+LAMBDA_WIDTH = 0.01  # 幅ペナルティ
+
+df = pd.read_csv(FEAT_CSV, parse_dates=["date"], index_col="date")
+
+reserved = {"y_next_close","y_next_logret","split","big_move","sample_weight"}
+feat_cols = [c for c in df.columns if c not in reserved]
+
+def to_np(d):
+    return d[feat_cols].values.astype("float32"), d["y_next_close"].values.astype("float32"), d["sample_weight"].values.astype("float32")
+
+train_df = df[df["split"]=="train"].copy()
+val_df   = df[df["split"]=="val"].copy()
+test_df  = df[df["split"]=="test"].copy()
+
+Xtr_raw, ytr_raw, wtr_raw = to_np(train_df)
+Xva_raw, yva_raw, _ = to_np(val_df)
+Xte_raw, yte_raw, _ = to_np(test_df)
+
+# 追加特徴（方向用）：delta_days, after_long_gap, z_vol_60
+def extra_feats(dall):
+    delta = dall.index.to_series().diff().dt.days.fillna(1).values.astype("float32")
+    after_gap = (delta>3).astype("float32")
+    if "volume" in df.columns:
+        vol = np.log1p(df["volume"].reindex(dall.index).values.astype("float32"))
+        z60 = (pd.Series(vol, index=dall.index)-pd.Series(vol, index=dall.index).rolling(60).mean())/pd.Series(vol, index=dall.index).rolling(60).std()
+        z60 = z60.fillna(0).values.astype("float32")
+    else:
+        z60 = np.zeros(len(dall),dtype="float32")
+    return np.stack([delta, after_gap, z60], axis=1)
+
+EX_all = extra_feats(df)
+EX_tr, EX_va, EX_te = EX_all[df["split"]=="train"], EX_all[df["split"]=="val"], EX_all[df["split"]=="test"]
+
+# スケーリング
+xsc, ysc = StandardScaler(), StandardScaler()
+Xtr = xsc.fit_transform(Xtr_raw); Xva = xsc.transform(Xva_raw); Xte = xsc.transform(Xte_raw)
+ytr = ysc.fit_transform(ytr_raw.reshape(-1,1)).ravel()
+yva = ysc.transform(yva_raw.reshape(-1,1)).ravel()
+yte = ysc.transform(yte_raw.reshape(-1,1)).ravel()
+
+# 方向用の追加特徴は別スケーラ
+exsc = StandardScaler()
+EX_tr_sc = exsc.fit_transform(EX_tr); EX_va_sc = exsc.transform(EX_va); EX_te_sc = exsc.transform(EX_te)
+
+# シーケンス化
+def make_seq(X, y, L):
+    xs, ys = [], []
+    for i in range(L, len(X)):
+        xs.append(X[i-L:i]); ys.append(y[i])
+    return np.array(xs, np.float32), np.array(ys, np.float32)
+
+Xtr_seq, ytr_seq = make_seq(Xtr, ytr, LOOKBACK)
+wtr_seq = wtr_raw[LOOKBACK:] if USE_WEIGHTS else np.ones_like(ytr_seq, dtype="float32")
+
+Xva_stack = np.vstack([Xtr[-LOOKBACK:], Xva]); yva_stack = np.hstack([ytr[-LOOKBACK:], yva])
+Xva_seq_all, yva_seq_all = make_seq(Xva_stack, yva_stack, LOOKBACK)
+Xva_seq, yva_seq = Xva_seq_all[-len(yva):], yva_seq_all[-len(yva):]
+
+class SeqDS(Dataset):
+    def __init__(self, X, y, w): self.X=torch.tensor(X); self.y=torch.tensor(y); self.w=torch.tensor(w)
+    def __len__(self): return len(self.y)
+    def __getitem__(self,i): return self.X[i], self.y[i], self.w[i]
+
+train_dl = DataLoader(SeqDS(Xtr_seq, ytr_seq, wtr_seq), batch_size=128, shuffle=True)
+val_dl   = DataLoader(SeqDS(Xva_seq, yva_seq, np.ones_like(yva_seq)), batch_size=256, shuffle=False)
+
+# モデル：単調パラメトリック分位（q50=m, q10=m-softplus(a), q90=m+softplus(b)）
+class LSTMMonoQuantile(nn.Module):
+    def __init__(self, d_in, d_h=64, n_layers=2, dropout=0.2):
+        super().__init__()
+        self.lstm = nn.LSTM(d_in, d_h, num_layers=n_layers, dropout=dropout, batch_first=True)
+        self.head = nn.Sequential(nn.Linear(d_h, 64), nn.ReLU(), nn.Linear(64, 3))  # m,a,b
+        self.softplus = nn.Softplus()
+    def forward(self, x):
+        o,_ = self.lstm(x)
+        h = self.head(o[:,-1,:])             # [B,3]
+        m,a,b = h[:,0:1], self.softplus(h[:,1:2]), self.softplus(h[:,2:3])
+        q10 = m - a; q50 = m; q90 = m + b     # [B,1]各
+        return torch.cat([q10,q50,q90], dim=1)
+
+def pinball(qs, y, yhat):                    # y: [B], yhat: [B,3]
+    y = y.unsqueeze(1); e = y - yhat
+    return torch.maximum(qs*e, (qs-1)*e).mean()
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = LSTMMonoQuantile(d_in=Xtr_seq.shape[-1]).to(device)
+opt = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-5)
+
+best=1e9; patience=7; bad=0
+for ep in range(1, 60+1):
+    model.train(); tr=0; n=0
+    for xb,yb,wb in train_dl:
+        xb,yb,wb = xb.to(device), yb.to(device), wb.to(device)
+        opt.zero_grad()
+        q = model(xb)                         # [B,3] std空間
+        loss_pin = pinball(QUANTILES.to(device), yb, q)
+        width = (q[:,2]-q[:,0]).mean()
+        loss = (loss_pin*wb).mean() if USE_WEIGHTS else loss_pin
+        loss = loss + LAMBDA_WIDTH*width      # 幅を絞る
+        loss.backward(); opt.step()
+        tr += loss.item()*xb.size(0); n += xb.size(0)
+    tr /= n
+    model.eval(); va=0; n=0
+    with torch.no_grad():
+        for xb,yb,_ in val_dl:
+            xb,yb = xb.to(device), yb.to(device)
+            q = model(xb)
+            loss_pin = pinball(QUANTILES.to(device), yb, q)
+            width = (q[:,2]-q[:,0]).mean()
+            loss = loss_pin + LAMBDA_WIDTH*width
+            va += loss.item()*xb.size(0); n += xb.size(0)
+    va/=n
+    print(f"ep{ep:02d} train={tr:.5f} val={va:.5f}")
+    if va<best: best=va; bad=0; torch.save(model.state_dict(), f"{OUT_DIR}/lstm_mono_quantile.pt")
+    else:
+        bad+=1
+        if bad>=patience: break
+
+# 方向：ロジスティック（up/down）
+# ラベル作成（trainのみ）。同値は除外。
+prev_tr = train_df["close"].shift(1).values
+dir_tr = np.sign(train_df["y_next_close"].values - prev_tr)
+mask = dir_tr!=0
+X_dir_tr = np.hstack([Xtr_raw[mask], EX_tr_sc[mask]])       # 生のXに追加特徴を結合→後で標準化
+dir_scaler = StandardScaler().fit(X_dir_tr)
+X_dir_tr_sc = dir_scaler.transform(X_dir_tr)
+y_dir_tr = (dir_tr[mask]>0).astype(int)
+
+clf = LogisticRegression(max_iter=1000, class_weight="balanced")
+clf.fit(X_dir_tr_sc, y_dir_tr)
+
+# 保存
+with open(f"{OUT_DIR}/x_scaler.pkl","wb") as f: pickle.dump(xsc, f)
+with open(f"{OUT_DIR}/y_scaler.pkl","wb") as f: pickle.dump(ysc, f)
+with open(f"{OUT_DIR}/ex_scaler.pkl","wb") as f: pickle.dump(exsc, f)
+with open(f"{OUT_DIR}/dir_scaler.pkl","wb") as f: pickle.dump(dir_scaler, f)
+with open(f"{OUT_DIR}/dir_clf.pkl","wb") as f: pickle.dump(clf, f)
+meta = {"feat_csv": FEAT_CSV, "feat_cols": feat_cols, "lookback": LOOKBACK,
+        "quantiles":[0.1,0.5,0.9], "lambda_width": LAMBDA_WIDTH}
+with open(f"{OUT_DIR}/meta.json","w") as f: json.dump(meta, f, indent=2)
+print("保存:", OUT_DIR)
