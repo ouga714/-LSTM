@@ -1,0 +1,229 @@
+# ============================
+# 旧モデル(従来LSTMQuantile)と新モデル(単調分位+幅ペナルティ)を同一条件で評価
+#  - 点誤差: RMSE/MAE
+#  - 方向性: 3値DA, 2値DA、SMA5ベースライン
+#  - 区間: Coverage/AvgWidth（生/Conformal(CQR)）
+#  - 新モデルのみ: 方向分類器の確率閾値スイープ
+# 出力: /content/ntt_out/eval_compare/*
+# 前提: セル1/2を実行済み（新モデル・分類器）。旧モデルは任意（無ければスキップ）。
+# ============================
+import os, json, math, pickle, numpy as np, pandas as pd, torch, torch.nn as nn
+from sklearn.metrics import mean_squared_error, mean_absolute_error, accuracy_score, confusion_matrix
+import matplotlib.pyplot as plt
+
+OUT_DIR  = "/content/ntt_out"
+FEAT_CSV = "/content/ntt_data/engineered_timeseries.csv"
+
+assert os.path.isfile(FEAT_CSV), "FEAT_CSV がありません。セル1を実行してください。"
+assert os.path.isfile(f"{OUT_DIR}/meta.json"), "meta.json がありません。セル2を実行してください。"
+
+# ---- メタ・スケーラ・（新モデル用）分類器 ----
+with open(f"{OUT_DIR}/meta.json") as f: meta = json.load(f)
+feat_cols = meta["feat_cols"]; LOOKBACK = meta["lookback"]
+
+with open(f"{OUT_DIR}/x_scaler.pkl","rb") as f: xsc = pickle.load(f)
+with open(f"{OUT_DIR}/y_scaler.pkl","rb") as f: ysc = pickle.load(f)
+
+# 新モデルの方向分類器は存在すれば使う
+clf = dir_scaler = exsc = None
+if os.path.isfile(f"{OUT_DIR}/dir_clf.pkl") and os.path.isfile(f"{OUT_DIR}/dir_scaler.pkl") and os.path.isfile(f"{OUT_DIR}/ex_scaler.pkl"):
+    with open(f"{OUT_DIR}/dir_clf.pkl","rb") as f: clf = pickle.load(f)
+    with open(f"{OUT_DIR}/dir_scaler.pkl","rb") as f: dir_scaler = pickle.load(f)
+    with open(f"{OUT_DIR}/ex_scaler.pkl","rb") as f: exsc = pickle.load(f)
+
+# ---- データ読み込み・分割 ----
+df = pd.read_csv(FEAT_CSV, parse_dates=["date"], index_col="date")
+train_df = df[df["split"]=="train"].copy()
+val_df   = df[df["split"]=="val"].copy()
+test_df  = df[df["split"]=="test"].copy()
+
+Xtr_raw = train_df[feat_cols].values.astype("float32")
+Xva_raw = val_df[feat_cols].values.astype("float32")
+Xte_raw = test_df[feat_cols].values.astype("float32")
+yva_raw = val_df["y_next_close"].values.astype("float32")
+yte_raw = test_df["y_next_close"].values.astype("float32")
+
+# 標準化特徴
+Xtr = xsc.transform(Xtr_raw); Xva = xsc.transform(Xva_raw); Xte = xsc.transform(Xte_raw)
+
+# 追加特徴（方向分類器用。存在しない場合はゼロで占位）
+def extra_feats(idx):
+    delta = idx.to_series().diff().dt.days.fillna(1).values.astype("float32")
+    after_gap = (delta>3).astype("float32")
+    if "volume" in df.columns:
+        vol = np.log1p(df["volume"].reindex(idx).values.astype("float32"))
+        s = pd.Series(vol, index=idx)
+        z60 = ((s - s.rolling(60).mean())/s.rolling(60).std()).fillna(0).values.astype("float32")
+    else:
+        z60 = np.zeros(len(idx), dtype="float32")
+    return np.stack([delta, after_gap, z60], axis=1)
+
+EX_tr = extra_feats(train_df.index)
+EX_va = extra_feats(val_df.index)
+EX_te = extra_feats(test_df.index)
+if exsc is not None:
+    EX_tr_sc, EX_va_sc, EX_te_sc = exsc.transform(EX_tr), exsc.transform(EX_va), exsc.transform(EX_te)
+else:
+    EX_tr_sc = EX_va_sc = EX_te_sc = np.zeros_like(EX_te)
+
+# ---- LSTM 入力系列（val文脈→test）----
+def make_seqX(X, L):
+    return np.array([X[i-L:i] for i in range(L, len(X))], np.float32)
+
+Xva_seq = make_seqX(np.vstack([Xtr[-LOOKBACK:], Xva]), LOOKBACK)[-len(Xva):]
+Xte_seq = make_seqX(np.vstack([Xva[-LOOKBACK:], Xte]), LOOKBACK)[-len(Xte):]
+
+# ---- 旧/新 モデル定義 ----
+class LSTMQuantile(nn.Module):  # 旧
+    def __init__(self, d_in, d_h=64, n_layers=2, dropout=0.2, n_out=3):
+        super().__init__()
+        self.lstm = nn.LSTM(d_in, d_h, num_layers=n_layers, dropout=dropout, batch_first=True)
+        self.head = nn.Sequential(nn.Linear(d_h, 64), nn.ReLU(), nn.Linear(64, n_out))
+    def forward(self, x):
+        o,_ = self.lstm(x); return self.head(o[:,-1,:])
+
+class LSTMMonoQuantile(nn.Module):  # 新
+    def __init__(self, d_in, d_h=64, n_layers=2, dropout=0.2):
+        super().__init__()
+        self.lstm = nn.LSTM(d_in, d_h, num_layers=n_layers, dropout=dropout, batch_first=True)
+        self.head = nn.Sequential(nn.Linear(d_h, 64), nn.ReLU(), nn.Linear(64, 3))  # m,a,b
+        self.softplus = nn.Softplus()
+    def forward(self, x):
+        o,_ = self.lstm(x)
+        h = self.head(o[:,-1,:])
+        m = h[:,0:1]; a = self.softplus(h[:,1:2]); b = self.softplus(h[:,2:3])
+        q10 = m - a; q50 = m; q90 = m + b
+        return torch.cat([q10,q50,q90], dim=1)
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# ---- 推論ユーティリティ ----
+def predict_quantiles(model, w_path, X_seq):
+    model.load_state_dict(torch.load(w_path, map_location=device))
+    model.eval()
+    with torch.no_grad():
+        pred_std = model(torch.tensor(X_seq).to(device)).cpu().numpy()  # 標準化空間
+    return ysc.inverse_transform(pred_std)  # 価格へ
+
+def eval_block(y_true, q10, q50, q90, prev_close, prefix, out_dir):
+    mask = ~np.isnan(prev_close)
+    y = y_true[mask]; q10m, q50m, q90m = q10[mask], q50[mask], q90[mask]; prev = prev_close[mask]
+    # 点
+    rmse = math.sqrt(mean_squared_error(y, q50m)); mae = mean_absolute_error(y, q50m)
+    # 方向
+    true3 = np.sign(y - prev).astype(int); pred3 = np.sign(q50m - prev).astype(int)
+    acc3 = float((true3 == pred3).mean())
+    nz = (true3 != 0)
+    acc2 = float(accuracy_score((true3[nz]>0).astype(int), (pred3[nz]>0).astype(int))) if nz.any() else float('nan')
+    # 区間
+    cov = float(((y>=q10m)&(y<=q90m)).mean()); wid = float(np.mean(q90m-q10m))
+    # ベースライン（SMA5）
+    sma5 = df["SMA_5"].reindex(test_df.index).values[mask]
+    acc_sma = float((np.sign(sma5 - prev).astype(int) == true3).mean())
+    # 混同行列保存
+    cm = confusion_matrix(true3, pred3, labels=[-1,0,1])
+    os.makedirs(out_dir, exist_ok=True)
+    pd.DataFrame(cm, index=["T-1","T0","T+1"], columns=["P-1","P0","P+1"]).to_csv(os.path.join(out_dir, f"{prefix}_confusion_3class.csv"))
+    return {
+        "RMSE": rmse, "MAE": mae,
+        "DA_3class_q50": acc3, "DA_2class_q50": acc2,
+        "SMA5_DA_3class": acc_sma,
+        "PI_Coverage": cov, "PI_AvgWidth": wid
+    }
+
+def cqr_calibrate(q10_val, q50_val, q90_val, y_val, q10_te, q90_te, alpha=0.10):
+    # s_i = max(q_lo - y, y - q_hi)
+    s = np.maximum(q10_val - y_val, y_val - q90_val)
+    k = int(np.ceil((1 - alpha) * (len(s) + 1))) - 1
+    k = np.clip(k, 0, len(s)-1)
+    gamma = float(np.partition(s, k)[k])
+    return q10_te - gamma, q90_te + gamma, gamma
+
+# ---- 旧モデル（存在すれば）----
+old_path = os.path.join(OUT_DIR, "lstm_quantile.pt")
+old_result = None
+if os.path.isfile(old_path):
+    old_model = LSTMQuantile(d_in=Xte_seq.shape[-1]).to(device)
+    # val/test 予測
+    pred_old_va = predict_quantiles(old_model, old_path, Xva_seq)
+    pred_old_te = predict_quantiles(old_model, old_path, Xte_seq)
+    q10o_va,q50o_va,q90o_va = pred_old_va[:,0], pred_old_va[:,1], pred_old_va[:,2]
+    q10o,q50o,q90o = pred_old_te[:,0], pred_old_te[:,1], pred_old_te[:,2]
+    # 評価（生区間）
+    prev_close = df.loc[test_df.index, "close"].shift(1).values
+    comp_dir = os.path.join(OUT_DIR, "eval_compare"); os.makedirs(comp_dir, exist_ok=True)
+    old_raw = eval_block(yte_raw, q10o, q50o, q90o, prev_close, "old_raw", comp_dir)
+    # CQR較正
+    q10o_c, q90o_c, gamma_old = cqr_calibrate(q10o_va, q50o_va, q90o_va, yva_raw, q10o, q90o, alpha=0.10)
+    cov_c = float(((yte_raw>=q10o_c)&(yte_raw<=q90o_c)).mean())
+    wid_c = float(np.mean(q90o_c - q10o_c))
+    old_result = {"raw": old_raw, "CQR": {"PI_Coverage": cov_c, "PI_AvgWidth": wid_c, "gamma": gamma_old}}
+else:
+    print("旧モデル(lstm_quantile.pt)は見つかりません。旧評価はスキップします。")
+
+# ---- 新モデル（必須：セル2で学習済み）----
+new_path = os.path.join(OUT_DIR, "lstm_mono_quantile.pt")
+assert os.path.isfile(new_path), "新モデル(lstm_mono_quantile.pt)がありません。セル2を実行してください。"
+new_model = LSTMMonoQuantile(d_in=Xte_seq.shape[-1]).to(device)
+pred_new_va = predict_quantiles(new_model, new_path, Xva_seq)
+pred_new_te = predict_quantiles(new_model, new_path, Xte_seq)
+q10n_va,q50n_va,q90n_va = pred_new_va[:,0], pred_new_va[:,1], pred_new_va[:,2]
+q10n,q50n,q90n = pred_new_te[:,0], pred_new_te[:,1], pred_new_te[:,2]
+
+prev_close = df.loc[test_df.index, "close"].shift(1).values
+comp_dir = os.path.join(OUT_DIR, "eval_compare"); os.makedirs(comp_dir, exist_ok=True)
+new_raw = eval_block(yte_raw, q10n, q50n, q90n, prev_close, "new_raw", comp_dir)
+
+# CQR較正（新）
+q10n_c, q90n_c, gamma_new = cqr_calibrate(q10n_va, q50n_va, q90n_va, yva_raw, q10n, q90n, alpha=0.10)
+cov_c_new = float(((yte_raw>=q10n_c)&(yte_raw<=q90n_c)).mean())
+wid_c_new = float(np.mean(q90n_c - q10n_c))
+
+# ---- 新モデルの方向分類器: 閾値スイープ ----
+dir_curve = None
+if (clf is not None) and (dir_scaler is not None):
+    # 分類器入力 = 元特徴 + 追加特徴（スケール済み）を結合しdir_scalerで最終スケール
+    X_dir_te = np.hstack([Xte_raw, EX_te_sc])
+    mask_valid = ~np.isnan(prev_close)
+    X_dir_te_sc = dir_scaler.transform(X_dir_te[mask_valid])
+    true3 = np.sign(yte_raw[mask_valid]-prev_close[mask_valid]).astype(int)
+    p_up = clf.predict_proba(X_dir_te_sc)[:,1]
+    def sweep(p):
+        out={}
+        for thr in np.linspace(0.50,0.80,7):
+            pred = (p>=thr).astype(int)
+            idx = (true3!=0)
+            if idx.any():
+                acc = accuracy_score((true3[idx]>0).astype(int), pred[idx])
+                cov = float(idx.mean())  # ここは「上下発生割合」。採用率は常にこのidx内100%運用。
+                out[f"{thr:.2f}"]={"DA_updown":float(acc),"used_ratio":float(cov)}
+        return out
+    dir_curve = sweep(p_up)
+
+# ---- まとめと保存・可視化 ----
+report = {
+    "old_model" : old_result if old_result is not None else "not_available",
+    "new_model" : {
+        "raw": new_raw,
+        "CQR": {"PI_Coverage": cov_c_new, "PI_AvgWidth": wid_c_new, "gamma": gamma_new},
+        "direction_classifier_threshold_sweep": dir_curve if dir_curve is not None else "not_available"
+    }
+}
+with open(os.path.join(comp_dir, "compare_report.json"), "w") as f:
+    json.dump(report, f, indent=2, ensure_ascii=False)
+print(json.dumps(report, indent=2, ensure_ascii=False))
+
+# 区間の可視化（旧/新のrawとCQR）
+dates = test_df.index
+plt.figure(figsize=(12,4))
+plt.plot(dates, yte_raw, label="Actual", linewidth=1.0)
+if old_result is not None:
+    plt.fill_between(dates, q10o, q90o, alpha=0.12, label="OLD raw")
+    plt.fill_between(dates, q10o_c, q90o_c, alpha=0.12, label="OLD CQR")
+plt.fill_between(dates, q10n, q90n, alpha=0.20, label="NEW raw")
+plt.fill_between(dates, q10n_c, q90n_c, alpha=0.20, label="NEW CQR")
+plt.plot(dates, q50n, label="NEW q50", linewidth=0.8)
+plt.title("Intervals: OLD vs NEW (raw & CQR)"); plt.legend(); plt.tight_layout()
+plt.savefig(os.path.join(comp_dir, "intervals_old_new.png")); plt.show()
+
+print("Saved to:", comp_dir)
