@@ -10,9 +10,7 @@ CSV_PATH = "/content/drive/MyDrive/stock_price.csv"  # ←指定のファイル
 OUT_DIR  = "/content/ntt_eda"
 os.makedirs(OUT_DIR, exist_ok=True)
 
-# =========================
-# 1) 読む（日本語列に対応）
-# =========================
+# 1) 読み取り
 def parse_human_volume(x):
     """ '79.15M' のような表記を数値へ """
     if pd.isna(x): return np.nan
@@ -28,7 +26,7 @@ def parse_human_volume(x):
 
 df = pd.read_csv(CSV_PATH)
 
-# よくある日本語カラム名を英語化
+# 日本語カラム名を英語化
 df = df.rename(columns={
     "日付け":"date", "日付":"date",
     "終値":"close", "始値":"open", "高値":"high", "安値":"low",
@@ -37,7 +35,7 @@ df = df.rename(columns={
 if "date" not in df.columns:
     df = df.rename(columns={df.columns[0]:"date"})
 
-# 型を整えて並べ替え
+# 型を整えて並べ替える
 df["date"] = pd.to_datetime(df["date"])
 df = df.sort_values("date").drop_duplicates("date").set_index("date")
 for c in ["open","high","low","close"]:
@@ -52,9 +50,7 @@ df["logret"] = np.log(df["close"]/df["close"].shift(1))
 if "volume" in df.columns:
     df["log_volume"] = np.log1p(df["volume"])
 
-# =========================
 # 2) 基本統計量（平均、分散など）
-# =========================
 num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
 stats = df[num_cols].describe(percentiles=[.01,.05,.25,.5,.75,.95,.99]).T
 stats["skew"]     = df[num_cols].skew()   # 歪度
@@ -68,9 +64,8 @@ print("\n■ データの期間と欠損")
 print("期間:", df.index.min().date(), "→", df.index.max().date(), "| 行数:", len(df))
 display(df[num_cols].isna().sum().to_frame("missing_count"))
 
-# =========================
-# 3) 推移のグラフ（見る）
-# =========================
+
+# 3) 推移のグラフについて
 def save_line(series, title, fname, ylabel=None):
     plt.figure()
     series.plot()
@@ -111,9 +106,7 @@ roll_std  = df["close"].rolling(win).std()
 save_line(roll_mean, f"Rolling mean ({win})", "rolling_mean.png", "price")
 save_line(roll_std,  f"Rolling std  ({win})", "rolling_std.png", "std")
 
-# =========================
 # 4) 季節性（カレンダー観点）
-# =========================
 cal = pd.DataFrame(index=df.index)
 cal["month"] = df.index.month
 cal["dow"]   = df.index.dayofweek
@@ -133,10 +126,8 @@ plt.title("Mean return by weekday (0=Mon)")
 plt.xlabel("weekday"); plt.ylabel("mean ret")
 plt.tight_layout(); plt.savefig(f"{OUT_DIR}/dow_ret.png"); plt.show()
 
-# =========================
 # 5) 異常（大きな変動日）とギャップ
-# =========================
-# 大変動日: logret の3σ超
+# 変動が大きい日: logret の3σ超
 thr = 3 * df["logret"].std(skipna=True)
 big = df["logret"].abs() > thr
 events = df.loc[big, ["close","logret"] + (["volume"] if "volume" in df.columns else [])]
