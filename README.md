@@ -1,25 +1,20 @@
 # -LSTM
 Athena Technology社の技術課題
-株価をLSTMを用いて予測する。
-LSTM を用いた量子回帰（Pinball Loss)
-
-時系列データについて、過去60日のデータから次のデータを予測する
-
-評価指標は、以下である。
-点予測（q50）: RMSE, MAE, MAPE, Directional Accuracy（上げ下げ）
-区間: PI Coverage（q10–q90 に入る割合）, PI Avg Width（平均幅）
-
-要修正
--LSTM README
 本リポジトリは、株価終値系列に対して LSTM + 分位回帰 を用い、
 点予測（中央値 q50） と 不確実性の区間推定（q10–q90） を同時に行う実装です。
-さらに、実務適用を想定し、Conformalized Quantile Regression (CQR) による区間の較正、
+
+時系列データについて、過去60日のデータから次のデータを予測します。
+
+評価指標は、以下である。
+点予測（q50）: RMSE, MAE, Directional Accuracy（上げ下げ）
+区間: PI Coverage（q10–q90 に入る割合）, PI Avg Width（平均幅）
+
+さらに、Conformalized Quantile Regression (CQR) による区間の較正、
 および 方向（上昇/下落）分類器 を組み合わせた検証スクリプトを含みます。
 1. プログラムの概要
 1.1 目的
 翌営業日の終値の分位を予測し、予測区間として提示
-予測区間の**被覆率（Coverage）と幅（AvgWidth）**を管理
-方向（上がる/下がる）を分類器で補強し、実務の意思決定（エントリー・見送り・サイズ調整）に接続
+予測区間の被覆率（Coverage）と幅（AvgWidth）管理
 1.2 手法の要点
 LSTM 分位回帰：q10, q50, q90 を同時に推定
 旧モデル：素の分位出力
